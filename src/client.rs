@@ -1,31 +1,14 @@
-use std::{collections::HashMap, fmt::Error, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use rumqttc::{AsyncClient, QoS};
+use rumqttc::{AsyncClient, ClientError, Event, Incoming, Publish, QoS};
 use tokio::{
     sync::{oneshot, Mutex},
     time::error::Elapsed,
 };
 use uuid::Uuid;
 
-use crate::without_trailing_slashes;
-
-struct SendHelperError {
-    id: String,
-    error: Box<dyn std::error::Error>,
-}
-
-impl<E> From<(String, E)> for SendHelperError
-where
-    E: Into<Box<dyn std::error::Error>>,
-{
-    fn from((id, error): (String, E)) -> SendHelperError {
-        SendHelperError {
-            id,
-            error: error.into(),
-        }
-    }
-}
+use crate::{get_endpoint_id, without_trailing_slashes};
 
 fn generate_uuid() -> String {
     let mut buf = Uuid::encode_buffer();
@@ -56,6 +39,24 @@ where
     }
 }
 
+#[derive(Debug)]
+pub enum SendError {
+    ClientError(ClientError),
+    Timeout,
+}
+
+impl From<ClientError> for SendError {
+    fn from(c: ClientError) -> Self {
+        SendError::ClientError(c)
+    }
+}
+
+impl From<Elapsed> for SendError {
+    fn from(_: Elapsed) -> Self {
+        SendError::Timeout
+    }
+}
+
 impl<B> Request<B>
 where
     B: Into<Vec<u8>>,
@@ -75,42 +76,34 @@ where
         self
     }
 
-    pub async fn send(self) -> Result<Bytes, Elapsed> {
+    pub async fn send(self) -> Result<Bytes, SendError> {
+        // Open response channel and register with client
         let (tx, rx) = oneshot::channel();
-        self.client
-            .responders
-            .lock()
-            .await
-            .insert(self.id.clone(), tx);
-        self.client
-            .mqtt
-            .publish(
-                format!("{}{}", self.client.base_req_topic, self.id),
-                QoS::ExactlyOnce,
-                false,
-                self.body,
-            )
-            .await
-            .unwrap();
-        // .map_err(|e| (id.to_string(), e))?;
+        self.client.register_responder(&self.id, tx).await;
 
-        // Result::unwrap should be safe: oneshot channel must remain open
-        match self.timeout {
-            Some(dur) => tokio::time::timeout(dur, rx).await.map(Result::unwrap),
-            None => Ok(rx.await.unwrap()),
+        // Make send helper to act on possible errors (remove oneshot channel from registry)
+        let body = self.body;
+        let mqtt = self.client.mqtt.clone();
+        let topic = format!("{}{}", self.client.base_req_topic, self.id);
+        let timeout = self.timeout;
+        let send = async move {
+            mqtt.publish(topic, QoS::ExactlyOnce, false, body).await?;
+
+            // Result::unwrap should be safe: oneshot channel must remain open
+            Ok(match timeout {
+                Some(dur) => tokio::time::timeout(dur, rx).await.map(Result::unwrap)?,
+                None => rx.await.unwrap(),
+            })
+        };
+
+        // Send request
+        let result = send.await;
+
+        // If request failed (connection -or- timeout), remove channel from registry
+        if result.is_err() {
+            self.client.remove_responder(&self.id).await;
         }
-
-        // Ok(tokio::time::timeout(timeout, rx)
-        //     .await
-        //     .map(Result::unwrap)
-        //     .map_err(|e| (id.to_string(), e))?)
-        // let res = tokio::time::timeout(timeout, rx).await.map(Result::unwrap);
-
-        // // if timeout, remove sender end
-        // if res.is_err() {
-        //     self.responders.lock().await.remove(id);
-        // }
-        // Ok(res?)
+        result
     }
 }
 
@@ -146,12 +139,52 @@ impl Client {
         })
     }
 
-    pub async fn set_response(&self, res_id: &str, payload: Bytes) -> bool {
+    /// Method for traceability
+    async fn register_responder(
+        &self,
+        id: impl Into<String> + Display,
+        tx: oneshot::Sender<Bytes>,
+    ) {
+        let mut responders = self.responders.lock().await;
+        log::debug!("Request registered: {}", id);
+        responders.insert(id.into(), tx);
+        log::trace!("{} active requests", responders.len());
+    }
+
+    /// Method for traceability
+    async fn remove_responder(&self, id: &str) -> Option<oneshot::Sender<Bytes>> {
+        let mut responders = self.responders.lock().await;
+        let responder = responders.remove(id);
+        if responder.is_some() {
+            log::debug!("Request removed: {}", id);
+        }
+        log::trace!("{} active requests", responders.len());
+        responder
+    }
+
+    async fn set_response(&self, res_id: &str, payload: Bytes) -> bool {
         let mut set = false;
-        if let Some(chan) = self.responders.lock().await.remove(res_id) {
+        if let Some(chan) = self.remove_responder(res_id).await {
             set = chan.send(payload).is_ok();
         }
         set
+    }
+
+    /// Parse and set response if possible
+    /// Return Some(request id) if it was possible
+    pub async fn parse_response<'ev>(&self, event: &'ev Event) -> Option<&'ev str> {
+        match event {
+            Event::Incoming(Incoming::Publish(Publish { topic, payload, .. })) => {
+                let mut maybe_res_id = get_endpoint_id(&self.base_res_topic, topic);
+                if let Some(res_id) = maybe_res_id {
+                    if !self.set_response(res_id, payload.clone()).await {
+                        maybe_res_id = None;
+                    }
+                }
+                maybe_res_id
+            }
+            _ => None,
+        }
     }
 
     pub fn request<B>(&self, body: B) -> Request<B>

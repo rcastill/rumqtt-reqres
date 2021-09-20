@@ -41,6 +41,7 @@ async fn main() {
         match eventloop.poll().await {
             Ok(ev) => {
                 if let Some(res) = service.parse_request(&ev) {
+                    eprintln!("Got request");
                     tokio::spawn(res.respond_once(|_| "Hello World!"));
                 }
             }
