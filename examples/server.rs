@@ -6,6 +6,9 @@ use tokio::time::sleep;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::warn!("TODO: REMEMBER RECONNECTION LOGIC");
+
     // MQTT Options
     let mut opts = MqttOptions::new("mqtt-reqres-server", "localhost", 1883);
     opts.set_clean_session(true)
@@ -40,8 +43,8 @@ async fn main() {
     loop {
         match eventloop.poll().await {
             Ok(ev) => {
-                if let Some(res) = service.parse_request(&ev) {
-                    eprintln!("Got request");
+                if let Some(res) = service.parse_request(&ev).await {
+                    log::info!("Got request");
                     tokio::spawn(res.respond_once(|_| "Hello World!"));
                 }
             }

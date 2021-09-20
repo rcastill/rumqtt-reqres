@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use rumqttc::{AsyncClient, ClientError, Event, Incoming, Publish, QoS};
+use rumqttc::{
+    AsyncClient, ClientError, ConnAck, ConnectReturnCode, Event, Incoming, Publish, QoS,
+};
 
 pub mod client;
 
@@ -43,19 +45,34 @@ impl Service {
 
         // Subscribe to requests
         // TODO: Re-subscribe on reconnection
-        let all_requests = format!("{}+", base_req_topic);
-        client.subscribe(&all_requests, QoS::ExactlyOnce).await?;
+        // let all_requests = format!("{}+", base_req_topic);
+        // client.subscribe(&all_requests, QoS::ExactlyOnce).await?;
 
         // Create new service
-        Ok(Service {
+        let service = Service {
             client: client.clone(),
             base_req_topic,
             base_res_topic: format!("{}/responses/", topic),
-        })
+        };
+        service.subscribe_to_requests().await?;
+        Ok(service)
     }
 
-    pub fn parse_request(&self, event: &Event) -> Option<Responder> {
+    async fn subscribe_to_requests(&self) -> Result<(), rumqttc::ClientError> {
+        let all_requests = format!("{}+", self.base_req_topic);
+        self.client.subscribe(&all_requests, QoS::ExactlyOnce).await
+    }
+
+    pub async fn parse_request(&self, event: &Event) -> Option<Responder> {
         match event {
+            Event::Incoming(Incoming::ConnAck(ConnAck { code, .. })) => {
+                if code == &ConnectReturnCode::Success {
+                    if let Err(e) = self.subscribe_to_requests().await {
+                        log::warn!("Cannot subscribe: {}", e);
+                    }
+                }
+                None
+            }
             Event::Incoming(Incoming::Publish(Publish { topic, payload, .. })) => {
                 get_endpoint_id(&self.base_req_topic, topic).map(|reqid| Responder {
                     client: self.client.clone(),
@@ -114,7 +131,7 @@ mod test {
             ("", ""),
             ("/only/one/", "/only/one"),
         ];
-        for (test, expected) in test_pairs {
+        for &(test, expected) in &test_pairs {
             assert_eq!(without_trailing_slashes(test), expected)
         }
     }

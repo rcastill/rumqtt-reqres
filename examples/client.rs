@@ -9,6 +9,7 @@ use tokio::time::sleep;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::warn!("TODO: REMEMBER RECONNECTION LOGIC");
 
     // MQTT Options
     let mut opts = MqttOptions::new("mqtt-reqres-client", "localhost", 1883);
