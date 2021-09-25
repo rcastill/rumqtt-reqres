@@ -8,7 +8,14 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{get_endpoint_id, without_trailing_slashes};
+use crate::{
+    get_endpoint_id, subscribe_if_connected, without_trailing_slashes, SubscriptionHandle,
+};
+
+pub enum Reaction<'ev> {
+    Response(&'ev str),
+    Subscribe(SubscriptionHandle),
+}
 
 fn generate_uuid() -> String {
     let mut buf = Uuid::encode_buffer();
@@ -125,10 +132,9 @@ impl Client {
         let base_res_topic = format!("{}/responses/", topic);
 
         // Subscribe to requests
-        // TODO: Re-subscribe on reconnection
-        // TODO: almost same code in Client::subscribe/Service::subscribe
-        let all_responses = format!("{}+", base_res_topic);
-        mqtt.subscribe(&all_responses, QoS::ExactlyOnce).await?;
+        SubscriptionHandle::with_root(&base_res_topic, mqtt)
+            .subscribe()
+            .await?;
 
         // Create new service
         Ok(Client {
@@ -172,7 +178,17 @@ impl Client {
 
     /// Parse and set response if possible
     /// Return Some(request id) if it was possible
-    pub async fn parse_response<'ev>(&self, event: &'ev Event) -> Option<&'ev str> {
+    /// React to rumqtt event; either:
+    ///
+    /// - Detect connection, return Some(Reaction::Subscribe(SubscribeHandle))
+    /// - Detect response, return Some(Reaction::Response(request id))
+    pub async fn react<'ev>(&self, event: &'ev Event) -> Option<Reaction<'ev>> {
+        let sub = subscribe_if_connected(event, &self.mqtt, &self.base_res_topic)
+            .await
+            .map(Reaction::Subscribe);
+        if sub.is_some() {
+            return sub;
+        }
         match event {
             Event::Incoming(Incoming::Publish(Publish { topic, payload, .. })) => {
                 let mut maybe_res_id = get_endpoint_id(&self.base_res_topic, topic);
@@ -181,7 +197,7 @@ impl Client {
                         maybe_res_id = None;
                     }
                 }
-                maybe_res_id
+                maybe_res_id.map(Reaction::Response)
             }
             _ => None,
         }

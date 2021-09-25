@@ -1,13 +1,12 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use rumqtt_reqres::Service;
+use rumqtt_reqres::{Reaction, Service};
 use rumqttc::{AsyncClient, MqttOptions};
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    log::warn!("TODO: REMEMBER RECONNECTION LOGIC");
 
     // MQTT Options
     let mut opts = MqttOptions::new("mqtt-reqres-server", "localhost", 1883);
@@ -40,14 +39,30 @@ async fn main() {
 
     // Respond to requests
     // TODO: respond something meaningful
+    let resubh = Arc::new(Mutex::new(None));
     loop {
         match eventloop.poll().await {
-            Ok(ev) => {
-                if let Some(res) = service.parse_request(&ev).await {
+            Ok(ev) => match service.react(&ev).await {
+                Some(Reaction::Request(res)) => {
                     log::info!("Got request");
                     tokio::spawn(res.respond_once(|_| "Hello World!"));
                 }
-            }
+                Some(Reaction::Subscribe(subh)) => {
+                    if resubh.lock().await.is_some() {
+                        log::debug!("Still trying to re-subscribe from previous iteration");
+                        continue;
+                    }
+                    let container = resubh.clone();
+                    *resubh.lock().await = Some(tokio::spawn(async move {
+                        while let Err(e) = subh.subscribe().await {
+                            log::error!("Cannot re-subscribe: {}", e);
+                            sleep(Duration::from_secs(3)).await;
+                        }
+                        *container.lock().await = None;
+                    }));
+                }
+                None => {}
+            },
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 sleep(Duration::from_secs(1)).await;

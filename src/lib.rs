@@ -5,6 +5,43 @@ use rumqttc::{
 
 pub mod client;
 
+pub struct SubscriptionHandle {
+    topic: String,
+    client: AsyncClient,
+}
+
+impl SubscriptionHandle {
+    fn with_root(base_topic: &str, client: &AsyncClient) -> SubscriptionHandle {
+        SubscriptionHandle {
+            topic: format!("{}+", base_topic),
+            client: client.clone(),
+        }
+    }
+
+    pub async fn subscribe(&self) -> Result<(), rumqttc::ClientError> {
+        log::info!("Subscribing to {}", self.topic);
+        self.client.subscribe(&self.topic, QoS::ExactlyOnce).await
+    }
+}
+
+async fn subscribe_if_connected(
+    event: &Event,
+    client: &AsyncClient,
+    base_topic: &str,
+) -> Option<SubscriptionHandle> {
+    if let Event::Incoming(Incoming::ConnAck(ConnAck { code, .. })) = event {
+        if code == &ConnectReturnCode::Success {
+            return Some(SubscriptionHandle::with_root(base_topic, client));
+        }
+    }
+    None
+}
+
+pub enum Reaction {
+    Request(Responder),
+    Subscribe(SubscriptionHandle),
+}
+
 pub fn get_endpoint_id<'topic>(base_topic: &str, topic: &'topic str) -> Option<&'topic str> {
     if topic.len() <= base_topic.len() || !topic.starts_with(&base_topic) {
         return None;
@@ -44,40 +81,38 @@ impl Service {
         let base_req_topic = format!("{}/requests/", topic);
 
         // Subscribe to requests
-        // TODO: Re-subscribe on reconnection
-        // let all_requests = format!("{}+", base_req_topic);
-        // client.subscribe(&all_requests, QoS::ExactlyOnce).await?;
+        SubscriptionHandle::with_root(&base_req_topic, client)
+            .subscribe()
+            .await?;
 
         // Create new service
-        let service = Service {
+        Ok(Service {
             client: client.clone(),
             base_req_topic,
             base_res_topic: format!("{}/responses/", topic),
-        };
-        service.subscribe_to_requests().await?;
-        Ok(service)
+        })
     }
 
-    async fn subscribe_to_requests(&self) -> Result<(), rumqttc::ClientError> {
-        let all_requests = format!("{}+", self.base_req_topic);
-        self.client.subscribe(&all_requests, QoS::ExactlyOnce).await
-    }
-
-    pub async fn parse_request(&self, event: &Event) -> Option<Responder> {
+    // pub async fn parse_request(&self, event: &Event) -> Option<Responder> {
+    /// React to rumqtt event; either:
+    ///
+    /// - Detect connection, return Some(Reaction::Subscribe(SubscribeHandle))
+    /// - Detect request, return Some(Reaction::Request(Responder))
+    pub async fn react(&self, event: &Event) -> Option<Reaction> {
+        let sub = subscribe_if_connected(event, &self.client, &self.base_req_topic)
+            .await
+            .map(Reaction::Subscribe);
+        if sub.is_some() {
+            return sub;
+        }
         match event {
-            Event::Incoming(Incoming::ConnAck(ConnAck { code, .. })) => {
-                if code == &ConnectReturnCode::Success {
-                    if let Err(e) = self.subscribe_to_requests().await {
-                        log::warn!("Cannot subscribe: {}", e);
-                    }
-                }
-                None
-            }
             Event::Incoming(Incoming::Publish(Publish { topic, payload, .. })) => {
-                get_endpoint_id(&self.base_req_topic, topic).map(|reqid| Responder {
-                    client: self.client.clone(),
-                    topic: format!("{}{}", self.base_res_topic, reqid),
-                    payload: payload.clone(),
+                get_endpoint_id(&self.base_req_topic, topic).map(|reqid| {
+                    Reaction::Request(Responder {
+                        client: self.client.clone(),
+                        topic: format!("{}{}", self.base_res_topic, reqid),
+                        payload: payload.clone(),
+                    })
                 })
             }
             _ => None,

@@ -1,15 +1,14 @@
 use std::{iter, time::Duration};
 
 use futures::{stream, StreamExt};
-use rumqtt_reqres::client::Client;
+use rumqtt_reqres::client::{Client, Reaction};
 // use rumqtt_reqres::Service;
 use rumqttc::{AsyncClient, MqttOptions};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    log::warn!("TODO: REMEMBER RECONNECTION LOGIC");
 
     // MQTT Options
     let mut opts = MqttOptions::new("mqtt-reqres-client", "localhost", 1883);
@@ -67,11 +66,18 @@ async fn main() {
     // Assign server responses
     loop {
         match eventloop.poll().await {
-            Ok(ev) => {
-                if let Some(resid) = cli.parse_response(&ev).await {
-                    eprintln!("Response set for {}", resid);
+            Ok(ev) => match cli.react(&ev).await {
+                Some(Reaction::Response(req_id)) => {
+                    eprintln!("Response set for {}", req_id);
                 }
-            }
+                Some(Reaction::Subscribe(subh)) => {
+                    timeout(Duration::from_secs(5), subh.subscribe())
+                        .await
+                        .expect("Timeout while trying to re-subscribe")
+                        .expect("Could not re-subscribe");
+                }
+                None => {}
+            },
             Err(e) => {
                 eprintln!("Connection error: {}", e);
                 sleep(Duration::from_secs(1)).await;
